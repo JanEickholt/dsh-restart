@@ -10,9 +10,9 @@
 
 - **模型工具 `restart_harness`**：让 agent 直接安排一次进程重启（可选 `delayMs`）。
 - **`/restart` 斜杠命令**：在 UI 里手动触发重启。
-- **配置卡片**（设置 → 插件 → 插件配置 → 「DSH 重启」）：可视化编辑以下设置，改动即时写入 `settings.yaml`：
+- **配置卡片**（设置 → 插件 → 「dsh-restart」页面）：可视化编辑以下设置，改动即时写入 profile 配置：
   - `legacyRestart` — 旧 PowerShell/WMI/taskkill 重启方式（默认关闭，用 Node 原生方式）。
-  - `continuePrompt` — 重启后自动继续时注入给 agent 的提示词。
+  - `continuePrompt` — 重启后自动继续时注入给 agent 的提示词。留空时按 DSH「语言」（Language）设置选择默认文案（`zh` 用中文，其余用英文，与 DSH 自身的 `FALLBACK_LOCALE` 一致）：注入中文会把中文模型后续回复也带成中文。
 - **「立即重启」按钮**：先读取当前进程身份，安排重启后等待新进程恢复并自动刷新页面。只读 GET 返回 `{ pid, startedAt }`；出于安全考虑，重启 POST 仍仅接受来自环回地址（127.0.0.1 / localhost）的同源请求，经反向代理/远程访问时会被拒绝（403）。
 
 > 自 `0.1.3-alpha.4` 起，内置 detached watchdog 已停用并从设置卡片移除。旧
@@ -26,7 +26,12 @@
 |---|---|---|
 | npm `latest`（当前正式发布插件） | `dsh-v0.1.1-rc.2` | 已验证维护基线 |
 | npm `next` 候选（`0.1.3-alpha.5`） | `dsh-v0.1.5-alpha.1` | 精确依赖与真实 profile 验收目标 |
-| 后续 DSH 正式版 | 尚未发布 | 发布并完成真实 profile 门禁后再声明兼容 |
+| 本分支（DSH `0.2.x` 适配） | `dsh 0.2.0-rc.2` | peer 范围 `^0.2.0-rc.1`，真实 profile 验收目标 |
+
+DSH `0.2.x` 在启动时校验插件的 `@deepseek-ai/dsh-*` peerDependencies，版本不符的
+插件会被拒绝加载。本分支的 host 半改为导出 cordis `Config` schema（`ctx.settings`
+不再有 `installSection`），客户端配置卡片迁移到 `configForms` 服务与插件管理页的
+`plugins.bundle.config` keyed slot；`0.1.x` 仍使用 npm 上已发布的 `0.1.3-alpha.5`。
 
 开发版不会覆盖 npm `latest`。`0.1.5-alpha.1` 依赖按精确版本锁定；该版本已移除
 `@deepseek-ai/dsh-client-runtime`，客户端契约分别迁移到 Cordis、
@@ -43,14 +48,12 @@
 
 ### 源码部署排错
 
-- 本开发分支只对齐官方标签 `dsh-v0.1.5-alpha.1`。源码 checkout 先执行
-  `corepack pnpm install --frozen-lockfile` 和 `corepack pnpm run build`，再把本地插件
+- 本开发分支只对齐 DSH `0.2.x`（`0.2.0-rc.2` 验证）。源码 checkout 先执行
+  `corepack pnpm install` 和 `corepack pnpm run build`，再把本地插件
   重新加入隔离 profile；只安装依赖但没有构建 workspace，会表现为缺少
   `@deepseek-ai/*/lib`，并不是 restart 拉起失败。
-- 如果页面显示 `list slot "settings.plugin.item" requires options.id`，说明 Harness
-  与插件客户端落在不同的开发期 slot 契约。`0.1.5-alpha.1` 的官方契约是 keyed slot，
-  本插件必须使用 `options.key`；不要直接改成 `id`，应统一 Harness 标签、插件分支
-  和 profile 锁文件后重装。
+- DSH `0.2.x` 的插件配置页在「设置 → 插件 → dsh-restart」；若卡片不出现，先确认
+  宿主与插件客户端同为 `0.2.x` 契约（`plugins.bundle.config` keyed slot）。
 - pnpm 首次安装 profile 依赖时可能把原生包写成待决的 `allowBuilds` 项。逐项确认
   `true` 或 `false` 后重跑 `dsh plugin --profile <name> add ...`，不要用全局放行绕过。
 - 若旧版本重启后已经停在浏览器 HTTP 错误页，请手工打开新进程日志打印的当前

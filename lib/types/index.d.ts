@@ -18,7 +18,49 @@
  *
  * @module dsh-restart
  */
-import type { Context } from '@deepseek-ai/cordis';
+import type { Context, Volatile } from '@deepseek-ai/cordis';
+import { type ContextFormed } from '@deepseek-ai/dsh-llm';
+import z from '@deepseek-ai/schemastery';
+declare module '@deepseek-ai/dsh-llm' {
+    interface MessageSourceMap {
+        'dsh-restart': {
+            kind: 'dsh-restart';
+        } & ContextFormed;
+    }
+}
 export declare const name = "dsh-restart";
 export declare const inject: string[];
-export declare function apply(ctx: Context): void;
+/**
+ * Plugin configuration. DSH 0.2.x derives the settings form from the exported
+ * `Config` schema and hands the resolved config to `apply` as its second
+ * argument. Volatile fields arrive as live references the settings form
+ * updates in place, so reading `.get()` at use time always sees current
+ * values; only volatile fields are editable through the form.
+ */
+interface RestartConfig {
+    legacyRestart: Volatile<boolean>;
+    /** Empty = follow the DSH Language setting (see defaultContinuePrompt). */
+    continuePrompt: Volatile<string>;
+    /** @deprecated Retained only so existing settings files remain readable. */
+    watchdogEnabled: boolean;
+    /** @deprecated The embedded watchdog is disabled and this value is ignored. */
+    watchdogCooldownMs: number;
+    /** @deprecated The embedded watchdog is disabled and this value is ignored. */
+    watchdogPollMs: number;
+}
+/** DSH reads this export for the settings form and config validation. */
+export declare const Config: z<Schemastery.ObjectS<NoInfer<{
+    legacyRestart: z<boolean, boolean, "volatile-defined">;
+    continuePrompt: z<string, string, "volatile-defined">;
+    watchdogEnabled: z<boolean, boolean, "defined">;
+    watchdogCooldownMs: z<number, number, "defined">;
+    watchdogPollMs: z<number, number, "defined">;
+}>>, Schemastery.ObjectT<NoInfer<{
+    legacyRestart: z<boolean, boolean, "volatile-defined">;
+    continuePrompt: z<string, string, "volatile-defined">;
+    watchdogEnabled: z<boolean, boolean, "defined">;
+    watchdogCooldownMs: z<number, number, "defined">;
+    watchdogPollMs: z<number, number, "defined">;
+}>>, "plain">;
+export declare function apply(ctx: Context, config?: RestartConfig): void;
+export {};

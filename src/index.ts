@@ -19,7 +19,7 @@
  * @module dsh-restart
  */
 
-import type { Context } from '@deepseek-ai/cordis'
+import type { Context, Volatile, VolatileSnapshot } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-commands'
 import type {} from '@deepseek-ai/dsh-agent'
@@ -27,7 +27,7 @@ import type {} from '@deepseek-ai/dsh-shell'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, type ContextFormed } from '@deepseek-ai/dsh-llm'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-settings'
 import { spawn } from 'node:child_process'
@@ -40,13 +40,28 @@ import { relaunchHelperSource } from './relaunch-helper.js'
 import { RestartCoordinator } from './restart-coordinator.js'
 import { superviseRestartHelper } from './restart-helper-lifecycle.js'
 
+// The auto-continue follow-up's producer kind (DSH 0.2.x message sources are a
+// merge-extensible sum type; each plugin declares its own kind).
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-restart': { kind: 'dsh-restart' } & ContextFormed
+  }
+}
+
 export const name = 'dsh-restart'
 export const inject = ['tools', 'commands', 'agents', 'shell', 'sandboxPolicy']
 
-/** Plugin configuration (editable via settings.yaml and, later, the UI card). */
+/**
+ * Plugin configuration. DSH 0.2.x derives the settings form from the exported
+ * `Config` schema and hands the resolved config to `apply` as its second
+ * argument. Volatile fields arrive as live references the settings form
+ * updates in place, so reading `.get()` at use time always sees current
+ * values; only volatile fields are editable through the form.
+ */
 interface RestartConfig {
-  legacyRestart: boolean
-  continuePrompt: string
+  legacyRestart: Volatile<boolean>
+  /** Empty = follow the DSH Language setting (see defaultContinuePrompt). */
+  continuePrompt: Volatile<string>
   /** @deprecated Retained only so existing settings files remain readable. */
   watchdogEnabled: boolean
   /** @deprecated The embedded watchdog is disabled and this value is ignored. */
@@ -55,20 +70,43 @@ interface RestartConfig {
   watchdogPollMs: number
 }
 
-const RestartConfigSchema: z<RestartConfig> = z.object({
-  legacyRestart: z.boolean().default(false),
-  continuePrompt: z.string().default('（系统已重启完成）请继续之前未完成的工作。'),
+const RestartConfigSchema = z.object({
+  legacyRestart: z.boolean().default(false).volatile(),
+  continuePrompt: z.string().default('').volatile(),
   watchdogEnabled: z.boolean().default(false),
   watchdogCooldownMs: z.number().default(60000),
   watchdogPollMs: z.number().default(1000),
 })
 
+/** DSH reads this export for the settings form and config validation. */
+export const Config = RestartConfigSchema
+
+/** A detached stand-in for a live reference, for hosts that pass no config. */
+const stableRef = <T>(value: T): Volatile<T> => ({ get: (): VolatileSnapshot<T> => value as VolatileSnapshot<T> })
+
 const DEFAULT_CONFIG: RestartConfig = {
-  legacyRestart: false,
-  continuePrompt: '（系统已重启完成）请继续之前未完成的工作。',
+  legacyRestart: stableRef(false),
+  continuePrompt: stableRef(''),
   watchdogEnabled: false,
   watchdogCooldownMs: 60000,
   watchdogPollMs: 1000,
+}
+
+/**
+ * The default continue prompt follows the DSH Language setting (the `locale`
+ * entry's BCP 47-style preference): Chinese for `zh`, English otherwise.
+ * An unset preference falls back to English, mirroring DSH's own
+ * FALLBACK_LOCALE. Injected Chinese text nudges Chinese-capable models into
+ * replying in Chinese for the rest of the session, so the prompt language
+ * must follow the configured UI language instead of being hardcoded.
+ */
+const ZH_CONTINUE_PROMPT = '（系统已重启完成）请继续之前未完成的工作。'
+const EN_CONTINUE_PROMPT = '(The system restart is complete.) Please continue the unfinished work.'
+
+/** The localized default prompt for the configured DSH language. */
+function defaultContinuePrompt(preference: string | undefined): string {
+  const language = preference?.split('-')[0]?.toLowerCase()
+  return language === 'zh' ? ZH_CONTINUE_PROMPT : EN_CONTINUE_PROMPT
 }
 
 /** The "process file index": boot facts for external inspection. */
@@ -158,13 +196,16 @@ function clearResumeMarker(): void {
   try { fs.unlinkSync(resumeFilePath()) } catch { /* already gone */ }
 }
 
+/** The DSH Language setting (`locale` entry), read through the settings service. */
+type ReadLocalePreference = () => string | undefined
+
 /**
  * After a restart, wait for the recorded session to be resumed (the client
  * re-opens it) and then inject one "continue" follow-up so the agent picks up
  * the interrupted work without a manual prompt. Polls the live agent registry;
  * gives up after ~60s and clears the marker.
  */
-function tryAutoContinue(ctx: Context, dynamic: () => RestartConfig): void {
+function tryAutoContinue(ctx: Context, dynamic: () => RestartConfig, readLocalePreference: ReadLocalePreference): void {
   const sessionIds = readResumeMarker()
   debugLog(`auto-continue: marker has ${sessionIds.length} session(s) ${JSON.stringify(sessionIds)}`)
   if (sessionIds.length === 0) return
@@ -177,9 +218,10 @@ function tryAutoContinue(ctx: Context, dynamic: () => RestartConfig): void {
       if (agent === undefined) continue
       debugLog(`auto-continue: agent for ${sessionId} is live, following up`)
       try {
+        const prompt = dynamic().continuePrompt.get().trim() || defaultContinuePrompt(readLocalePreference())
         agent.followup(createUserMessage({
-          content: [{ type: 'text', text: dynamic().continuePrompt }],
-          source: { kind: 'plugin', plugin: name, form: 'instructions' },
+          content: [{ type: 'text', text: prompt }],
+          source: { kind: 'dsh-restart', form: 'instructions' },
         }))
       } catch (error) {
         console.error('[dsh-restart] auto-continue failed:', error)
@@ -410,9 +452,10 @@ async function restartLegacy(ctx: Context, delayMs: number, policy: unknown): Pr
   }
   if (policy !== undefined) request.sandboxPolicy = policy
   const spec = ctx.shell.resolve(request as never)
-  const result = await ctx.shell.run(spec)
-  const stdout = result.stdout && typeof result.stdout.text === 'string' ? result.stdout.text : ''
-  const stderr = result.stderr && typeof result.stderr.text === 'string' ? result.stderr.text : ''
+  const execution = await ctx.shell.execute(spec)
+  const result = await execution.result()
+  const stdout = result.stdout?.text ?? ''
+  const stderr = result.stderr?.text ?? ''
   if (result.exitCode !== 0) {
     return { ok: false, error: 'legacy restart failed', exitCode: result.exitCode, stdout, stderr }
   }
@@ -423,7 +466,7 @@ async function restartLegacy(ctx: Context, delayMs: number, policy: unknown): Pr
   }
 }
 
-export function apply(ctx: Context): void {
+export function apply(ctx: Context, config: RestartConfig = DEFAULT_CONFIG): void {
   debugLog(`apply: start pid=${process.pid}`)
   try {
     writeProcessIndex()
@@ -432,22 +475,31 @@ export function apply(ctx: Context): void {
     debugLog('apply: writeProcessIndex THREW: ' + String(error))
   }
   disableLegacyWatchdog()
-  let resolveConfig: () => RestartConfig = () => DEFAULT_CONFIG
-  const dynamic = (): RestartConfig => resolveConfig()
+  // DSH 0.2.x validates config against the exported `Config` schema and
+  // restarts this plugin with fresh config on every settings write.
+  const dynamic = (): RestartConfig => config
+  // The DSH Language setting lives in the `locale` settings entry; the
+  // settings service exposes every entry's live values through describe().
+  let readLocalePreference: ReadLocalePreference = () => undefined
   try {
     ctx.inject(['settings'], (settingsCtx) => {
-      settingsCtx.settings.installSection(ctx, 'dsh-restart', RestartConfigSchema, DEFAULT_CONFIG, {
-        setSource: (get) => { resolveConfig = get },
-        onChange: () => {},
-      })
+      readLocalePreference = () => {
+        try {
+          const rows = settingsCtx.settings.describe() as { ns?: string; value?: { preference?: unknown } }[]
+          const preference = rows.find(row => row.ns === 'locale')?.value?.preference
+          return typeof preference === 'string' && preference !== '' ? preference : undefined
+        } catch {
+          return undefined
+        }
+      }
     })
     debugLog('apply: settings installed')
   } catch (error) {
-    debugLog('apply: settings installSection THREW: ' + String(error))
+    debugLog('apply: settings inject THREW: ' + String(error))
   }
 
   try {
-    tryAutoContinue(ctx, dynamic)
+    tryAutoContinue(ctx, dynamic, readLocalePreference)
     debugLog('apply: auto-continue scheduled')
   } catch (error) {
     debugLog('apply: tryAutoContinue THREW: ' + String(error))
@@ -521,7 +573,7 @@ export function apply(ctx: Context): void {
       // (already-ended) conversations are left alone — the client re-opens them.
       const sessionIds = runningSessionIds(ctx)
       if (sessionIds.length > 0) writeResumeMarker(sessionIds)
-      if (dynamic().legacyRestart) {
+      if (dynamic().legacyRestart.get()) {
         let policy: unknown
         if (exec?.agent?.session) {
           try { policy = ctx.sandboxPolicy.resolve({ session: exec.agent.session }) } catch { policy = undefined }
@@ -547,7 +599,7 @@ export function apply(ctx: Context): void {
       const sessionIds = runningSessionIds(ctx)
       if (sessionIds.length > 0) writeResumeMarker(sessionIds)
       let result: unknown
-      if (dynamic().legacyRestart) {
+      if (dynamic().legacyRestart.get()) {
         let policy: unknown
         if (invocation?.agent?.session) {
           try { policy = ctx.sandboxPolicy.resolve({ session: invocation.agent.session }) } catch { policy = undefined }
