@@ -46,6 +46,16 @@ DSH `0.2.x` 在启动时校验插件的 `@deepseek-ai/dsh-*` peerDependencies，
 - 防止并发请求重复安排 helper；helper 创建失败时保留旧进程，并记录失败日志。
 - 自动继续投递失败时保留恢复标记；Web 路由随 Cordis 生命周期正确释放。
 
+### 重启流程（本分支）
+
+- 旧进程在 `delayMs` 后经 DSH 自身的 SIGTERM 优雅关闭退出（Windows 仍直接退出）；
+  detached helper 等到旧 PID 真正退出后才拉起新进程，旧进程 30 秒内未退出则放弃拉起
+  并写入 `logErr`，不会出现两个 DSH 抢同一端口。helper 脚本启动即删除自身。
+- 在 systemd 服务（默认 `KillMode=control-group`）下 helper 会随旧进程一起被杀，由
+  服务的 `Restart=` 策略负责拉起；此时请确保 `Restart=always`（或 `on-success`）。
+- 恢复标记只在新进程中消费；已继续的会话会立即从标记中移除，已在运行的会话不会再被
+  注入继续提示；重启安排失败时标记会被清除。
+
 ### 源码部署排错
 
 - 本开发分支只对齐 DSH `0.2.x`（`0.2.0-rc.2` 验证）。源码 checkout 先执行

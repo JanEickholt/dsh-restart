@@ -8,11 +8,15 @@
  *   - discovery is unnecessary: this plugin runs INSIDE the DSH node process, so
  *     `process.pid` / `process.cwd()` / `process.execPath` / `process.execArgv` /
  *     `process.argv` are read directly.
- *   - relaunch: spawn a detached `node -e` helper (survives the parent's exit via
+ *   - relaunch: spawn a detached helper script (survives the parent's exit via
  *     `detached: true` + `stdio: 'ignore'` + `unref()`), which waits until the old
- *     process releases the listen port, then spawns the new DSH (same argv + cwd,
- *     stdout/stderr appended to timestamped logs). The old process then
- *     `process.exit(0)`s after `delayMs` so the tool result can flush first.
+ *     process has exited (and so released the listen port), then spawns the new
+ *     DSH (same argv + cwd, stdout/stderr appended to timestamped logs). The old
+ *     process leaves after `delayMs` so the tool result can flush first, through
+ *     DSH's own graceful SIGTERM shutdown where available (see exitForRestart).
+ *   - under a supervisor that kills the whole service cgroup on exit (systemd's
+ *     default KillMode=control-group) the helper dies with the old process and the
+ *     supervisor's own restart policy brings DSH back instead.
  *   - a "process index" file (`$DSH_HOME/dsh-process.json`) is still written at
  *     boot for external inspection (pid + cwd + command line).
  *
@@ -36,9 +40,9 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { performance } from 'node:perf_hooks'
-import { relaunchHelperSource } from './relaunch-helper.js'
+import { restartHelperScript } from './relaunch-helper.js'
 import { RestartCoordinator } from './restart-coordinator.js'
-import { superviseRestartHelper } from './restart-helper-lifecycle.js'
+import { exitForRestart, superviseRestartHelper } from './restart-helper-lifecycle.js'
 
 // The auto-continue follow-up's producer kind (DSH 0.2.x message sources are a
 // merge-extensible sum type; each plugin declares its own kind).
@@ -147,17 +151,30 @@ function disableLegacyWatchdog(): void {
   }
 }
 
-/** Record the in-progress sessions before restart (for auto-resume after reboot). */
-function writeResumeMarker(sessionIds: string[]): void {
+/** The resume marker: sessions to continue, and which process scheduled the restart. */
+interface ResumeMarker {
+  sessionIds: string[]
+  restartAt?: string
+  /**
+   * Identity of the process that wrote the marker; while it is still this one
+   * the restart has not happened. Both are compared because a PID alone repeats
+   * across restarts inside a PID namespace (DSH as PID 1 in a container).
+   */
+  pid?: number
+  startedAt?: string
+}
+
+function saveResumeMarker(marker: ResumeMarker): void {
   try {
-    fs.writeFileSync(resumeFilePath(), JSON.stringify({
-      sessionIds,
-      restartAt: new Date().toISOString(),
-      pid: process.pid,
-    }, null, 2) + '\n', 'utf8')
+    fs.writeFileSync(resumeFilePath(), JSON.stringify(marker, null, 2) + '\n', 'utf8')
   } catch (error) {
     console.error('[dsh-restart] failed to write resume marker:', error)
   }
+}
+
+/** Record the in-progress sessions before restart (for auto-resume after reboot). */
+function writeResumeMarker(sessionIds: string[]): void {
+  saveResumeMarker({ sessionIds, restartAt: new Date().toISOString(), pid: process.pid, startedAt: PROCESS_STARTED_AT })
 }
 
 /** Read a session id defensively from an agent-shaped object. */
@@ -168,19 +185,22 @@ function sessionIdOf(agent: unknown): string | undefined {
 }
 
 /** Read the resume marker recorded before the last restart (list or legacy single form). */
-function readResumeMarker(): string[] {
+function readResumeMarker(): ResumeMarker {
   try {
     const parsed = JSON.parse(fs.readFileSync(resumeFilePath(), 'utf8'))
-    const record = parsed as { sessionIds?: unknown; sessionId?: unknown }
+    const record = parsed as { sessionIds?: unknown; sessionId?: unknown; restartAt?: unknown; pid?: unknown; startedAt?: unknown }
+    const marker: ResumeMarker = { sessionIds: [] }
+    if (typeof record.restartAt === 'string') marker.restartAt = record.restartAt
+    if (typeof record.pid === 'number' && Number.isInteger(record.pid)) marker.pid = record.pid
+    if (typeof record.startedAt === 'string') marker.startedAt = record.startedAt
     if (Array.isArray(record.sessionIds)) {
-      return record.sessionIds.filter((id): id is string => typeof id === 'string' && id !== '')
+      marker.sessionIds = record.sessionIds.filter((id): id is string => typeof id === 'string' && id !== '')
+    } else if (typeof record.sessionId === 'string' && record.sessionId !== '') {
+      marker.sessionIds = [record.sessionId]
     }
-    if (typeof record.sessionId === 'string' && record.sessionId !== '') {
-      return [record.sessionId]
-    }
-    return []
+    return marker
   } catch {
-    return []
+    return { sessionIds: [] }
   }
 }
 
@@ -204,18 +224,36 @@ type ReadLocalePreference = () => string | undefined
  * re-opens it) and then inject one "continue" follow-up so the agent picks up
  * the interrupted work without a manual prompt. Polls the live agent registry;
  * gives up after ~60s and clears the marker.
+ *
+ * The marker is shrunk as sessions are continued, so a re-apply of this plugin
+ * (hot reload) inside the window never continues the same session twice, and a
+ * marker written by this very process (restart still pending, or a failed
+ * restart) is left alone instead of prompting sessions that never restarted.
  */
 function tryAutoContinue(ctx: Context, dynamic: () => RestartConfig, readLocalePreference: ReadLocalePreference): void {
-  const sessionIds = readResumeMarker()
+  const marker = readResumeMarker()
+  const { sessionIds } = marker
   debugLog(`auto-continue: marker has ${sessionIds.length} session(s) ${JSON.stringify(sessionIds)}`)
   if (sessionIds.length === 0) return
+  if (marker.pid === process.pid && marker.startedAt === PROCESS_STARTED_AT) {
+    debugLog('auto-continue: marker was written by this process (restart not happened yet), skipping')
+    return
+  }
   const pending = new Set(sessionIds)
   let attempts = 0
   const interval = setInterval(() => {
     attempts += 1
+    const before = pending.size
     for (const sessionId of [...pending]) {
       const agent = ctx.agents.get(sessionId as never)
       if (agent === undefined) continue
+      if (agent.status === 'running') {
+        // Something else (the user, the host's own recovery, another plugin)
+        // already resumed this session; a follow-up would queue a second turn.
+        debugLog(`auto-continue: ${sessionId} is already running, not following up`)
+        pending.delete(sessionId)
+        continue
+      }
       debugLog(`auto-continue: agent for ${sessionId} is live, following up`)
       try {
         const prompt = dynamic().continuePrompt.get().trim() || defaultContinuePrompt(readLocalePreference())
@@ -238,6 +276,8 @@ function tryAutoContinue(ctx: Context, dynamic: () => RestartConfig, readLocaleP
       debugLog(`auto-continue: timed out after 60s, ${pending.size} session(s) never resumed: ${JSON.stringify([...pending])}`)
       clearInterval(interval)
       clearResumeMarker()
+    } else if (pending.size < before) {
+      saveResumeMarker({ ...marker, sessionIds: [...pending] })
     }
   }, 500)
   ctx.effect(() => () => clearInterval(interval))
@@ -286,6 +326,9 @@ interface RestartInfo {
 
 const restartCoordinator = new RestartCoordinator<RestartInfo>()
 
+/** How long the helper waits past the scheduled exit for the old process to go. */
+const OLD_PROCESS_EXIT_TIMEOUT_MS = 30_000
+
 /**
  * Node-native self-restart. Spawns a detached helper that relaunches DSH after
  * the current process has exited and released its port, then schedules the
@@ -299,33 +342,18 @@ function launchRestart(delayMs: number): RestartInfo {
   const logErr = path.join(os.tmpdir(), `dsh-restart-${stamp}.err.log`)
   const helperPath = path.join(os.tmpdir(), `dsh-restart-helper-${process.pid}-${Date.now()}.cjs`)
 
-  // Detached helper: waits for the old process to release its port, then spawns
-  // the new DSH with the same argv + cwd, output appended to the log files.
   // Written to a temp .cjs rather than passed via `node -e`, because the shared
   // relaunch helper contains quoting that does not survive an inline argument.
-  const helperCode = [
-    "const { spawn, spawnSync } = require('node:child_process')",
-    "const fs = require('node:fs')",
-    "const os = require('node:os')",
-    "const path = require('node:path')",
-    relaunchHelperSource(),
-    `const argv = ${JSON.stringify(argv)}`,
-    `const cwd = ${JSON.stringify(cwd)}`,
-    `const logOut = ${JSON.stringify(logOut)}`,
-    `const logErr = ${JSON.stringify(logErr)}`,
-    `const selfPath = ${JSON.stringify(helperPath)}`,
-    `const delay = ${delayMs + 800}`,
-    'setTimeout(() => {',
-    '  try {',
-    '    relaunchDsh(process.execPath, argv, cwd, logOut, logErr)',
-    '  } catch (e) {',
-    "    try { fs.appendFileSync(logErr, new Date().toISOString() + ' relaunch failed: ' + String(e && e.stack || e) + '\\n', 'utf8') } catch {}",
-    '  } finally {',
-    '    try { fs.unlinkSync(selfPath) } catch {}',
-    '    process.exit(0)',
-    '  }',
-    '}, delay)',
-  ].join('\n')
+  const helperCode = restartHelperScript({
+    argv,
+    cwd,
+    logOut,
+    logErr,
+    selfPath: helperPath,
+    oldPid: process.pid,
+    delayMs,
+    exitTimeoutMs: OLD_PROCESS_EXIT_TIMEOUT_MS,
+  })
 
   fs.writeFileSync(helperPath, helperCode, 'utf8')
   const helper = spawn(process.execPath, [helperPath], {
@@ -345,9 +373,12 @@ function launchRestart(delayMs: number): RestartInfo {
   }
   superviseRestartHelper(helper, {
     delayMs,
-    exit: () => process.exit(0),
+    exit: () => exitForRestart(process),
     onError: (error) => {
       restartCoordinator.release(info)
+      // The process stays up, so nothing restarted: a leftover marker would
+      // prompt these sessions on some unrelated later boot.
+      clearResumeMarker()
       try { fs.unlinkSync(helperPath) } catch { /* helper never owned cleanup */ }
       console.error('[dsh-restart] failed to spawn restart helper:', error)
       debugLog(`restart helper spawn failed: ${String(error)}`)
@@ -357,7 +388,22 @@ function launchRestart(delayMs: number): RestartInfo {
 }
 
 function restart(delayMs: number): RestartInfo {
-  return restartCoordinator.claim(() => launchRestart(delayMs)).value
+  try {
+    return restartCoordinator.claim(() => launchRestart(delayMs)).value
+  } catch (error) {
+    clearResumeMarker()
+    debugLog(`restart scheduling failed: ${String(error)}`)
+    throw error
+  }
+}
+
+/** Upper bound for a model-supplied delay (setTimeout clamps >2^31-1 to 1ms). */
+const MAX_RESTART_DELAY_MS = 60_000
+
+/** Normalize the tool's optional delay: positive integer ms, default 2000. */
+function restartDelayMs(value: unknown): number {
+  const delayMs = Number(value)
+  return delayMs > 0 ? Math.min(Math.floor(delayMs), MAX_RESTART_DELAY_MS) : 2000
 }
 
 interface WebRestartRequest {
@@ -444,19 +490,29 @@ $result = [ordered]@{ pid = $pid0; cwd = $cwd; commandLine = $cmdline; delayMs =
 $result | ConvertTo-Json -Compress`
 }
 
-/** Run the legacy PowerShell/WMI restart through the shell service. */
+/**
+ * Run the legacy PowerShell/WMI restart through the shell service. When the
+ * script fails this process keeps running, so its resume marker is dropped.
+ */
 async function restartLegacy(ctx: Context, delayMs: number, policy: unknown): Promise<unknown> {
   const request: Record<string, unknown> = {
     command: buildLegacyScript(indexFilePath(), delayMs),
     timeoutMs: 30000,
   }
   if (policy !== undefined) request.sandboxPolicy = policy
-  const spec = ctx.shell.resolve(request as never)
-  const execution = await ctx.shell.execute(spec)
-  const result = await execution.result()
+  let result
+  try {
+    const spec = ctx.shell.resolve(request as never)
+    const execution = await ctx.shell.execute(spec)
+    result = await execution.result()
+  } catch (error) {
+    clearResumeMarker()
+    throw error
+  }
   const stdout = result.stdout?.text ?? ''
   const stderr = result.stderr?.text ?? ''
   if (result.exitCode !== 0) {
+    clearResumeMarker()
     return { ok: false, error: 'legacy restart failed', exitCode: result.exitCode, stdout, stderr }
   }
   try {
@@ -475,8 +531,8 @@ export function apply(ctx: Context, config: RestartConfig = DEFAULT_CONFIG): voi
     debugLog('apply: writeProcessIndex THREW: ' + String(error))
   }
   disableLegacyWatchdog()
-  // DSH 0.2.x validates config against the exported `Config` schema and
-  // restarts this plugin with fresh config on every settings write.
+  // DSH 0.2.x validates config against the exported `Config` schema; volatile
+  // fields are committed in place, other changes restart this plugin.
   const dynamic = (): RestartConfig => config
   // The DSH Language setting lives in the `locale` settings entry; the
   // settings service exposes every entry's live values through describe().
@@ -538,7 +594,17 @@ export function apply(ctx: Context, config: RestartConfig = DEFAULT_CONFIG): voi
         }
         const sessionIds = runningSessionIds(ctx)
         if (sessionIds.length > 0) writeResumeMarker(sessionIds)
-        const result = restart(2000)
+        let result: RestartInfo
+        try {
+          result = restart(2000)
+        } catch (error) {
+          res.writeHead(500, {
+            'content-type': 'application/json; charset=utf-8',
+            'cache-control': 'no-store',
+          })
+          res.end(JSON.stringify({ ok: false, error: String(error) }))
+          return
+        }
         res.writeHead(202, {
           'content-type': 'application/json; charset=utf-8',
           'cache-control': 'no-store',
@@ -568,7 +634,7 @@ export function apply(ctx: Context, config: RestartConfig = DEFAULT_CONFIG): voi
     },
     async execute(args, exec) {
       const a = (args ?? {}) as { delayMs?: number }
-      const delayMs = Number(a.delayMs) > 0 ? Math.floor(Number(a.delayMs)) : 2000
+      const delayMs = restartDelayMs(a.delayMs)
       // Only resume sessions that were mid-turn (running) at restart time. Idle
       // (already-ended) conversations are left alone — the client re-opens them.
       const sessionIds = runningSessionIds(ctx)

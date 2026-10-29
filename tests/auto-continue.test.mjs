@@ -156,3 +156,158 @@ test('auto-continue keeps the recovery marker when followup throws', async () =>
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+/** A DSH_HOME sandbox plus a minimal 0.2.x-shaped host over a mutable agent table. */
+function sandbox(marker) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-restart-auto-continue-'))
+  const markerPath = path.join(root, 'dsh-resume.json')
+  const previousHome = process.env.DSH_HOME
+  const originalConsoleError = console.error
+  const cleanups = []
+  const agents = new Map()
+  const followups = []
+  const commands = []
+  process.env.DSH_HOME = root
+  console.error = () => {}
+  if (marker !== undefined) fs.writeFileSync(markerPath, JSON.stringify(marker), 'utf8')
+
+  const agent = (id, status = 'idle') => ({
+    id,
+    status,
+    followup(message) { followups.push({ id, text: message.content[0]?.text }) },
+  })
+  const ctx = {
+    agents: {
+      get: id => agents.get(id),
+      roots: () => [...agents.values()],
+    },
+    commands: { register(command) { commands.push(command) } },
+    effect(register) {
+      const cleanup = register()
+      if (typeof cleanup === 'function') cleanups.push(cleanup)
+    },
+    inject(dependencies, callback) {
+      if (dependencies.includes('settings')) callback({ settings: { describe: () => [] } })
+    },
+    sandboxPolicy: { resolve() { return undefined } },
+    shell: {},
+    tools: { register() {} },
+  }
+  return {
+    agents,
+    agent,
+    commands,
+    ctx,
+    followups,
+    markerPath,
+    readMarker: () => fs.existsSync(markerPath) ? JSON.parse(fs.readFileSync(markerPath, 'utf8')) : undefined,
+    unload() {
+      while (cleanups.length > 0) cleanups.pop()()
+    },
+    dispose() {
+      this.unload()
+      console.error = originalConsoleError
+      if (previousHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previousHome
+      fs.rmSync(root, { recursive: true, force: true })
+    },
+  }
+}
+
+const OTHER_PID = process.pid + 1
+
+test('auto-continue ignores a marker written by this same process', async () => {
+  const box = sandbox()
+  try {
+    // The restart command writes the marker in this process; the failing
+    // legacy shell keeps the process from going anywhere.
+    box.agents.set('session-1', box.agent('session-1', 'running'))
+    let releaseShell
+    box.ctx.shell = {
+      resolve: request => request,
+      execute: () => new Promise(resolve => { releaseShell = resolve }),
+    }
+    apply(box.ctx, { ...BASE_CONFIG, legacyRestart: ref(true) })
+    const pendingRestart = box.commands.find(command => command.name === 'restart').handler({})
+    const written = box.readMarker()
+    assert.equal(written.pid, process.pid)
+    assert.equal(typeof written.startedAt, 'string')
+
+    // A hot reload re-applies the plugin while that restart is still pending.
+    box.unload()
+    box.agents.set('session-1', box.agent('session-1'))
+    apply(box.ctx, { ...BASE_CONFIG })
+    await wait(700)
+    assert.deepEqual(box.followups, [])
+    assert.deepEqual(box.readMarker()?.sessionIds, ['session-1'])
+    // Settle it inside the sandbox so its cleanup never touches the real DSH_HOME.
+    releaseShell({ result: async () => ({ exitCode: 1 }) })
+    assert.equal((await pendingRestart).kind, 'error')
+  } finally {
+    box.dispose()
+  }
+})
+
+test('auto-continue still consumes a marker from an earlier process that had the same PID', async () => {
+  const box = sandbox({ sessionIds: ['session-1'], pid: process.pid, startedAt: '2000-01-01T00:00:00.000Z' })
+  try {
+    box.agents.set('session-1', box.agent('session-1'))
+    apply(box.ctx, { ...BASE_CONFIG })
+    await wait(700)
+    assert.deepEqual(box.followups.map(f => f.id), ['session-1'])
+  } finally {
+    box.dispose()
+  }
+})
+
+test('auto-continue shrinks the marker so a plugin reload never continues a session twice', async () => {
+  const box = sandbox({ sessionIds: ['session-1', 'session-2'], pid: OTHER_PID, restartAt: '2026-10-29T00:00:00.000Z' })
+  try {
+    box.agents.set('session-1', box.agent('session-1'))
+    apply(box.ctx, { ...BASE_CONFIG })
+    await wait(700)
+    assert.deepEqual(box.followups.map(f => f.id), ['session-1'])
+    assert.deepEqual(box.readMarker(), { sessionIds: ['session-2'], pid: OTHER_PID, restartAt: '2026-10-29T00:00:00.000Z' })
+
+    // Hot reload: the plugin is applied again before session-2 resumed.
+    box.unload()
+    box.agents.set('session-2', box.agent('session-2'))
+    apply(box.ctx, { ...BASE_CONFIG })
+    await wait(700)
+    assert.deepEqual(box.followups.map(f => f.id), ['session-1', 'session-2'])
+    assert.equal(box.readMarker(), undefined)
+  } finally {
+    box.dispose()
+  }
+})
+
+test('auto-continue does not queue a second turn on a session that is already running', async () => {
+  const box = sandbox({ sessionIds: ['session-1'], pid: OTHER_PID })
+  try {
+    box.agents.set('session-1', box.agent('session-1', 'running'))
+    apply(box.ctx, { ...BASE_CONFIG })
+    await wait(700)
+    assert.deepEqual(box.followups, [])
+    assert.equal(box.readMarker(), undefined)
+  } finally {
+    box.dispose()
+  }
+})
+
+test('a failed legacy restart drops the resume marker it wrote', async () => {
+  const box = sandbox()
+  try {
+    box.agents.set('session-1', box.agent('session-1', 'running'))
+    box.ctx.shell = {
+      resolve: request => request,
+      execute: async () => ({ result: async () => ({ exitCode: 1, stdout: { text: '' }, stderr: { text: 'pwsh missing' } }) }),
+    }
+    apply(box.ctx, { ...BASE_CONFIG, legacyRestart: ref(true) })
+    const restartCommand = box.commands.find(command => command.name === 'restart')
+    const result = await restartCommand.handler({})
+    assert.equal(result.kind, 'error')
+    assert.equal(fs.existsSync(box.markerPath), false)
+  } finally {
+    box.dispose()
+  }
+})

@@ -8,11 +8,15 @@
  *   - discovery is unnecessary: this plugin runs INSIDE the DSH node process, so
  *     `process.pid` / `process.cwd()` / `process.execPath` / `process.execArgv` /
  *     `process.argv` are read directly.
- *   - relaunch: spawn a detached `node -e` helper (survives the parent's exit via
+ *   - relaunch: spawn a detached helper script (survives the parent's exit via
  *     `detached: true` + `stdio: 'ignore'` + `unref()`), which waits until the old
- *     process releases the listen port, then spawns the new DSH (same argv + cwd,
- *     stdout/stderr appended to timestamped logs). The old process then
- *     `process.exit(0)`s after `delayMs` so the tool result can flush first.
+ *     process has exited (and so released the listen port), then spawns the new
+ *     DSH (same argv + cwd, stdout/stderr appended to timestamped logs). The old
+ *     process leaves after `delayMs` so the tool result can flush first, through
+ *     DSH's own graceful SIGTERM shutdown where available (see exitForRestart).
+ *   - under a supervisor that kills the whole service cgroup on exit (systemd's
+ *     default KillMode=control-group) the helper dies with the old process and the
+ *     supervisor's own restart policy brings DSH back instead.
  *   - a "process index" file (`$DSH_HOME/dsh-process.json`) is still written at
  *     boot for external inspection (pid + cwd + command line).
  *
