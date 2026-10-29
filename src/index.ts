@@ -14,9 +14,10 @@
  *     DSH (same argv + cwd, stdout/stderr appended to timestamped logs). The old
  *     process leaves after `delayMs` so the tool result can flush first, through
  *     DSH's own graceful SIGTERM shutdown where available (see exitForRestart).
- *   - under a supervisor that kills the whole service cgroup on exit (systemd's
- *     default KillMode=control-group) the helper dies with the old process and the
- *     supervisor's own restart policy brings DSH back instead.
+ *   - the new DSH gets the environment DSH was launched with (relaunch-env.ts),
+ *     not the current one with `.env` values and the published proxy mixed in.
+ *   - as the main process of a systemd service no helper is used (it would die
+ *     with the service cgroup); the service manager restarts DSH (supervisor.ts).
  *   - a "process index" file (`$DSH_HOME/dsh-process.json`) is still written at
  *     boot for external inspection (pid + cwd + command line).
  *
@@ -34,7 +35,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createUserMessage, type ContextFormed } from '@deepseek-ai/dsh-llm'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-settings'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import process from 'node:process'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -43,6 +44,8 @@ import { performance } from 'node:perf_hooks'
 import { restartHelperScript } from './relaunch-helper.js'
 import { RestartCoordinator } from './restart-coordinator.js'
 import { exitForRestart, superviseRestartHelper } from './restart-helper-lifecycle.js'
+import { inheritedEnvironmentOf, relaunchEnvironment } from './relaunch-env.js'
+import { detectSystemdService, journalCommand, supervisedRestart, type SystemdService } from './supervisor.js'
 
 // The auto-continue follow-up's producer kind (DSH 0.2.x message sources are a
 // merge-extensible sum type; each plugin declares its own kind).
@@ -99,10 +102,14 @@ const DEFAULT_CONFIG: RestartConfig = {
 /**
  * The default continue prompt follows the DSH Language setting (the `locale`
  * entry's BCP 47-style preference): Chinese for `zh`, English otherwise.
- * An unset preference falls back to English, mirroring DSH's own
- * FALLBACK_LOCALE. Injected Chinese text nudges Chinese-capable models into
- * replying in Chinese for the rest of the session, so the prompt language
- * must follow the configured UI language instead of being hardcoded.
+ * Injected Chinese text nudges Chinese-capable models into replying in
+ * Chinese for the rest of the session, so the prompt language must follow the
+ * UI language instead of being hardcoded. With no preference the UI follows
+ * the browser, which the host cannot see directly; the browser half therefore
+ * reports its active locale (`x-dsh-locale` on this plugin's route, with the
+ * request's Accept-Language as a fallback) and the restart records it in the
+ * resume marker. Without any of these it falls back to English, mirroring
+ * DSH's own FALLBACK_LOCALE.
  */
 const ZH_CONTINUE_PROMPT = '（系统已重启完成）请继续之前未完成的工作。'
 const EN_CONTINUE_PROMPT = '(The system restart is complete.) Please continue the unfinished work.'
@@ -112,6 +119,26 @@ function defaultContinuePrompt(preference: string | undefined): string {
   const language = preference?.split('-')[0]?.toLowerCase()
   return language === 'zh' ? ZH_CONTINUE_PROMPT : EN_CONTINUE_PROMPT
 }
+
+const LOCALE_ID_PATTERN = /^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/u
+
+/** The browser UI's active locale, as reported on this plugin's Web route. */
+function uiLocaleOf(headers: WebRestartRequest['headers']): string | undefined {
+  const reported = headers['x-dsh-locale']
+  if (typeof reported === 'string' && LOCALE_ID_PATTERN.test(reported)) return reported
+  // Older clients send no hint: take the first built-in (zh/en) Accept-Language range.
+  const accepted = headers['accept-language']
+  if (typeof accepted !== 'string') return undefined
+  for (const range of accepted.split(',')) {
+    const tag = range.split(';')[0]?.trim() ?? ''
+    const primary = tag.split('-')[0]?.toLowerCase()
+    if ((primary === 'zh' || primary === 'en') && LOCALE_ID_PATTERN.test(tag)) return tag
+  }
+  return undefined
+}
+
+/** Last UI locale a browser reported to this process. */
+let reportedUiLocale: string | undefined
 
 /** The "process file index": boot facts for external inspection. */
 const INDEX_FILENAME = 'dsh-process.json'
@@ -162,6 +189,8 @@ interface ResumeMarker {
    */
   pid?: number
   startedAt?: string
+  /** The browser UI locale at restart time (see defaultContinuePrompt). */
+  uiLocale?: string
 }
 
 function saveResumeMarker(marker: ResumeMarker): void {
@@ -174,7 +203,9 @@ function saveResumeMarker(marker: ResumeMarker): void {
 
 /** Record the in-progress sessions before restart (for auto-resume after reboot). */
 function writeResumeMarker(sessionIds: string[]): void {
-  saveResumeMarker({ sessionIds, restartAt: new Date().toISOString(), pid: process.pid, startedAt: PROCESS_STARTED_AT })
+  const marker: ResumeMarker = { sessionIds, restartAt: new Date().toISOString(), pid: process.pid, startedAt: PROCESS_STARTED_AT }
+  if (reportedUiLocale !== undefined) marker.uiLocale = reportedUiLocale
+  saveResumeMarker(marker)
 }
 
 /** Read a session id defensively from an agent-shaped object. */
@@ -188,11 +219,12 @@ function sessionIdOf(agent: unknown): string | undefined {
 function readResumeMarker(): ResumeMarker {
   try {
     const parsed = JSON.parse(fs.readFileSync(resumeFilePath(), 'utf8'))
-    const record = parsed as { sessionIds?: unknown; sessionId?: unknown; restartAt?: unknown; pid?: unknown; startedAt?: unknown }
+    const record = parsed as { sessionIds?: unknown; sessionId?: unknown; restartAt?: unknown; pid?: unknown; startedAt?: unknown; uiLocale?: unknown }
     const marker: ResumeMarker = { sessionIds: [] }
     if (typeof record.restartAt === 'string') marker.restartAt = record.restartAt
     if (typeof record.pid === 'number' && Number.isInteger(record.pid)) marker.pid = record.pid
     if (typeof record.startedAt === 'string') marker.startedAt = record.startedAt
+    if (typeof record.uiLocale === 'string' && LOCALE_ID_PATTERN.test(record.uiLocale)) marker.uiLocale = record.uiLocale
     if (Array.isArray(record.sessionIds)) {
       marker.sessionIds = record.sessionIds.filter((id): id is string => typeof id === 'string' && id !== '')
     } else if (typeof record.sessionId === 'string' && record.sessionId !== '') {
@@ -219,18 +251,29 @@ function clearResumeMarker(): void {
 /** The DSH Language setting (`locale` entry), read through the settings service. */
 type ReadLocalePreference = () => string | undefined
 
+/** Host-owned "open this session" (the session controller's resolveAgent), when mounted. */
+type ResumeSession = (sessionId: string) => Promise<unknown>
+
 /**
- * After a restart, wait for the recorded session to be resumed (the client
- * re-opens it) and then inject one "continue" follow-up so the agent picks up
- * the interrupted work without a manual prompt. Polls the live agent registry;
- * gives up after ~60s and clears the marker.
+ * After a restart, bring each recorded session back and inject one "continue"
+ * follow-up so the agent picks up the interrupted work without a manual
+ * prompt. A session that no browser re-opens is resumed through the session
+ * controller, the same host-owned path the Web client uses to open a session:
+ * the agent is owned by the controller, not by this plugin, so a reload of
+ * this plugin never tears it down. Polls the live agent registry; gives up
+ * after ~60s and clears the marker.
  *
  * The marker is shrunk as sessions are continued, so a re-apply of this plugin
  * (hot reload) inside the window never continues the same session twice, and a
  * marker written by this very process (restart still pending, or a failed
  * restart) is left alone instead of prompting sessions that never restarted.
  */
-function tryAutoContinue(ctx: Context, dynamic: () => RestartConfig, readLocalePreference: ReadLocalePreference): void {
+function tryAutoContinue(
+  ctx: Context,
+  dynamic: () => RestartConfig,
+  readLocalePreference: ReadLocalePreference,
+  resumeSession: () => ResumeSession | undefined,
+): void {
   const marker = readResumeMarker()
   const { sessionIds } = marker
   debugLog(`auto-continue: marker has ${sessionIds.length} session(s) ${JSON.stringify(sessionIds)}`)
@@ -240,13 +283,35 @@ function tryAutoContinue(ctx: Context, dynamic: () => RestartConfig, readLocaleP
     return
   }
   const pending = new Set(sessionIds)
+  const resuming = new Set<string>()
+  const unresumable = new Set<string>()
   let attempts = 0
   const interval = setInterval(() => {
     attempts += 1
     const before = pending.size
     for (const sessionId of [...pending]) {
       const agent = ctx.agents.get(sessionId as never)
-      if (agent === undefined) continue
+      if (agent === undefined) {
+        if (unresumable.has(sessionId)) {
+          pending.delete(sessionId)
+          continue
+        }
+        const resume = resumeSession()
+        if (resume !== undefined && !resuming.has(sessionId)) {
+          resuming.add(sessionId)
+          debugLog(`auto-continue: resuming ${sessionId} through the session controller`)
+          resume(sessionId).then((result) => {
+            const error = (result as { error?: unknown } | undefined)?.error
+            if (error === undefined) return
+            debugLog(`auto-continue: cannot resume ${sessionId}: ${String((error as { message?: unknown }).message ?? error)}`)
+            unresumable.add(sessionId)
+          }, (error: unknown) => {
+            debugLog(`auto-continue: resume of ${sessionId} threw: ${String(error)}`)
+            unresumable.add(sessionId)
+          })
+        }
+        continue
+      }
       if (agent.status === 'running') {
         // Something else (the user, the host's own recovery, another plugin)
         // already resumed this session; a follow-up would queue a second turn.
@@ -256,7 +321,8 @@ function tryAutoContinue(ctx: Context, dynamic: () => RestartConfig, readLocaleP
       }
       debugLog(`auto-continue: agent for ${sessionId} is live, following up`)
       try {
-        const prompt = dynamic().continuePrompt.get().trim() || defaultContinuePrompt(readLocalePreference())
+        const prompt = dynamic().continuePrompt.get().trim()
+          || defaultContinuePrompt(readLocalePreference() ?? marker.uiLocale ?? reportedUiLocale)
         agent.followup(createUserMessage({
           content: [{ type: 'text', text: prompt }],
           source: { kind: 'dsh-restart', form: 'instructions' },
@@ -269,11 +335,11 @@ function tryAutoContinue(ctx: Context, dynamic: () => RestartConfig, readLocaleP
       pending.delete(sessionId)
     }
     if (pending.size === 0) {
-      debugLog('auto-continue: all sessions continued')
+      debugLog('auto-continue: done, no sessions left to continue')
       clearInterval(interval)
       clearResumeMarker()
     } else if (attempts >= 120) {
-      debugLog(`auto-continue: timed out after 60s, ${pending.size} session(s) never resumed: ${JSON.stringify([...pending])}`)
+      debugLog(`auto-continue: timed out after 60s, ${pending.size} session(s) never came back: ${JSON.stringify([...pending])}`)
       clearInterval(interval)
       clearResumeMarker()
     } else if (pending.size < before) {
@@ -322,6 +388,8 @@ interface RestartInfo {
   delayMs: number
   logOut: string
   logErr: string
+  /** Set when the service manager carries out the restart (no helper). */
+  supervisor?: string
 }
 
 const restartCoordinator = new RestartCoordinator<RestartInfo>()
@@ -329,12 +397,69 @@ const restartCoordinator = new RestartCoordinator<RestartInfo>()
 /** How long the helper waits past the scheduled exit for the old process to go. */
 const OLD_PROCESS_EXIT_TIMEOUT_MS = 30_000
 
+/** The systemd service this process is the main process of, if any. */
+function systemdService(): SystemdService | undefined {
+  return detectSystemdService({
+    platform: process.platform,
+    pid: process.pid,
+    env: process.env,
+    readCgroup: () => fs.readFileSync('/proc/self/cgroup', 'utf8'),
+    systemctl: (args) => {
+      const result = spawnSync('systemctl', args, { encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] })
+      return { status: result.status, stdout: result.stdout ?? '' }
+    },
+  })
+}
+
+/**
+ * Restart as the main process of a systemd service: the manager relaunches
+ * DSH, either after a graceful exit (Restart=always/on-success) or through a
+ * restart job. Returns undefined when not under such a service.
+ */
+function launchSupervisedRestart(delayMs: number): RestartInfo | undefined {
+  const service = systemdService()
+  if (service === undefined) return undefined
+  const route = supervisedRestart(service, process.getuid?.() === 0)
+  if (route.kind === 'unsupported') throw new Error(route.reason)
+  const journal = journalCommand(service)
+  const info: RestartInfo = {
+    ok: true,
+    pid: process.pid,
+    cwd: process.cwd(),
+    commandLine: launchCommandLine(),
+    delayMs,
+    logOut: journal,
+    logErr: journal,
+    supervisor: `systemd${service.user ? ' --user' : ''} ${service.unit} (Restart=${service.restart})`,
+  }
+  debugLog(`restart: under ${info.supervisor}, ${route.kind === 'exit' ? 'leaving for the manager to relaunch' : 'requesting a restart job'}`)
+  setTimeout(() => {
+    if (route.kind === 'exit') {
+      exitForRestart(process)
+      return
+    }
+    const job = spawn('systemctl', route.args, { stdio: 'ignore' })
+    const fail = (reason: string): void => {
+      restartCoordinator.release(info)
+      clearResumeMarker()
+      console.error(`[dsh-restart] systemctl ${route.args.join(' ')} failed: ${reason}`)
+      debugLog(`restart: systemctl ${route.args.join(' ')} failed: ${reason}`)
+    }
+    job.once('error', error => { fail(String(error)) })
+    job.once('exit', (code, signal) => { if (code !== 0) fail(`exit ${code ?? signal}`) })
+  }, delayMs)
+  return info
+}
+
 /**
  * Node-native self-restart. Spawns a detached helper that relaunches DSH after
  * the current process has exited and released its port, then schedules the
- * current process's own exit.
+ * current process's own exit. Under a systemd service the manager restarts
+ * DSH instead (launchSupervisedRestart).
  */
-function launchRestart(delayMs: number): RestartInfo {
+function launchRestart(delayMs: number, env: Record<string, string>): RestartInfo {
+  const supervised = launchSupervisedRestart(delayMs)
+  if (supervised !== undefined) return supervised
   const argv = [...process.execArgv, ...process.argv.slice(1)]
   const cwd = process.cwd()
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
@@ -356,10 +481,12 @@ function launchRestart(delayMs: number): RestartInfo {
   })
 
   fs.writeFileSync(helperPath, helperCode, 'utf8')
+  // The helper hands its own environment to the new DSH (relaunchDirect, and
+  // Start-Process through PowerShell on Windows).
   const helper = spawn(process.execPath, [helperPath], {
     detached: true,
     stdio: 'ignore',
-    env: process.env,
+    env,
     windowsHide: true,
   })
   const info: RestartInfo = {
@@ -387,9 +514,9 @@ function launchRestart(delayMs: number): RestartInfo {
   return info
 }
 
-function restart(delayMs: number): RestartInfo {
+function restart(ctx: Context, delayMs: number): RestartInfo {
   try {
-    return restartCoordinator.claim(() => launchRestart(delayMs)).value
+    return restartCoordinator.claim(() => launchRestart(delayMs, relaunchEnvironment(process.env, inheritedEnvironmentOf(ctx)))).value
   } catch (error) {
     clearResumeMarker()
     debugLog(`restart scheduling failed: ${String(error)}`)
@@ -408,7 +535,7 @@ function restartDelayMs(value: unknown): number {
 
 interface WebRestartRequest {
   socket: { remoteAddress?: string }
-  headers: { origin?: string; host?: string }
+  headers: { origin?: string; host?: string; 'accept-language'?: string; 'x-dsh-locale'?: string | string[] }
 }
 
 function isLoopbackWebRequest(req: WebRestartRequest): boolean {
@@ -554,8 +681,22 @@ export function apply(ctx: Context, config: RestartConfig = DEFAULT_CONFIG): voi
     debugLog('apply: settings inject THREW: ' + String(error))
   }
 
+  // The session controller (Web/API host) resumes sessions under its own
+  // fiber; optional, so other surfaces keep waiting for a client instead.
+  let resumeSession: ResumeSession | undefined
   try {
-    tryAutoContinue(ctx, dynamic, readLocalePreference)
+    ctx.inject(['sessionController'] as never, (controllerCtx: Context) => {
+      const controller = (controllerCtx as unknown as { sessionController?: { resolveAgent?: (id: never) => Promise<unknown> } }).sessionController
+      if (typeof controller?.resolveAgent !== 'function') return
+      resumeSession = sessionId => controller.resolveAgent!(sessionId as never)
+      controllerCtx.effect(() => () => { resumeSession = undefined }, 'dsh-restart: session resume')
+    })
+  } catch (error) {
+    debugLog('apply: sessionController inject THREW: ' + String(error))
+  }
+
+  try {
+    tryAutoContinue(ctx, dynamic, readLocalePreference, () => resumeSession)
     debugLog('apply: auto-continue scheduled')
   } catch (error) {
     debugLog('apply: tryAutoContinue THREW: ' + String(error))
@@ -575,6 +716,7 @@ export function apply(ctx: Context, config: RestartConfig = DEFAULT_CONFIG): voi
             res.end('forbidden')
             return
           }
+          reportedUiLocale = uiLocaleOf(req.headers) ?? reportedUiLocale
           res.writeHead(200, {
             'content-type': 'application/json; charset=utf-8',
             'cache-control': 'no-store',
@@ -592,11 +734,12 @@ export function apply(ctx: Context, config: RestartConfig = DEFAULT_CONFIG): voi
           res.end('forbidden')
           return
         }
+        reportedUiLocale = uiLocaleOf(req.headers) ?? reportedUiLocale
         const sessionIds = runningSessionIds(ctx)
         if (sessionIds.length > 0) writeResumeMarker(sessionIds)
         let result: RestartInfo
         try {
-          result = restart(2000)
+          result = restart(ctx, 2000)
         } catch (error) {
           res.writeHead(500, {
             'content-type': 'application/json; charset=utf-8',
@@ -647,7 +790,7 @@ export function apply(ctx: Context, config: RestartConfig = DEFAULT_CONFIG): voi
         const result = await restartLegacy(ctx, delayMs, policy)
         return { ...(result as object), sessionIds }
       }
-      return { ...restart(delayMs), sessionIds }
+      return { ...restart(ctx, delayMs), sessionIds }
     },
   }))
     debugLog('apply: restart_harness tool registered')
@@ -672,7 +815,11 @@ export function apply(ctx: Context, config: RestartConfig = DEFAULT_CONFIG): voi
         }
         result = await restartLegacy(ctx, 2000, policy)
       } else {
-        result = restart(2000)
+        try {
+          result = restart(ctx, 2000)
+        } catch (error) {
+          result = { ok: false, error: error instanceof Error ? error.message : String(error) }
+        }
       }
       const r = result as { ok?: boolean; pid?: number; delayMs?: number; logOut?: string; error?: string }
       if (r.ok === false) {

@@ -72,6 +72,7 @@ export function SettingsCard(props: SettingsCardProps) {
       const result = await restartAndWait({
         signal: controller.signal,
         isVisible: () => document.visibilityState === 'visible',
+        locale: props.uiLocale,
       })
       if (result === 'stale') {
         setRestartStale(true)

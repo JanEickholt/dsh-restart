@@ -13,6 +13,7 @@ import type { PluginConfigViewProps } from '@deepseek-ai/dsh-client-ui-plugin-ma
 import { SettingsCard } from './SettingsCard.tsx'
 import { en, zh } from './locales.ts'
 import { ensureStyles } from './styles.ts'
+import { reportUiLocale } from './restart-monitor.ts'
 
 export const name = 'dsh-restart-client'
 export const inject = ['slots', 'locale', 'configForms']
@@ -29,11 +30,20 @@ export type SettingsCardProps = PropsLocale<typeof NS> & PluginConfigViewProps &
   useDshRestart: <R>(selector: (snapshot: RestartCardState) => R) => R
   set: (field: string, value: unknown) => void
   clear: (field: string) => void
+  /** The UI's active locale, sent with the restart request. */
+  uiLocale: () => string
 }
 
 export function apply(ctx: Context): void {
   ensureStyles()
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-restart: dictionaries')
+
+  // With no explicit Language setting the UI follows the browser, which the
+  // host cannot see; report the active locale so the post-restart continue
+  // prompt matches what this UI shows.
+  const uiLocale = (): string => ctx.locale.getLocale().active
+  reportUiLocale(uiLocale())
+  ctx.on('locale/change', (snapshot) => { reportUiLocale(snapshot.active) })
 
   const scope = ctx.configForms.get<Record<string, unknown>>('dsh-restart')
 
@@ -64,6 +74,7 @@ export function apply(ctx: Context): void {
         hooks: { dshRestart: store },
         set: (field: string, value: unknown) => { void scope.set(field, value) },
         clear: (field: string) => { void scope.unset(field) },
+        uiLocale,
       }),
     }, SettingsCard)
   })

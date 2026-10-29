@@ -14,9 +14,10 @@
  *     DSH (same argv + cwd, stdout/stderr appended to timestamped logs). The old
  *     process leaves after `delayMs` so the tool result can flush first, through
  *     DSH's own graceful SIGTERM shutdown where available (see exitForRestart).
- *   - under a supervisor that kills the whole service cgroup on exit (systemd's
- *     default KillMode=control-group) the helper dies with the old process and the
- *     supervisor's own restart policy brings DSH back instead.
+ *   - the new DSH gets the environment DSH was launched with (relaunch-env.ts),
+ *     not the current one with `.env` values and the published proxy mixed in.
+ *   - as the main process of a systemd service no helper is used (it would die
+ *     with the service cgroup); the service manager restarts DSH (supervisor.ts).
  *   - a "process index" file (`$DSH_HOME/dsh-process.json`) is still written at
  *     boot for external inspection (pid + cwd + command line).
  *

@@ -158,7 +158,7 @@ test('auto-continue keeps the recovery marker when followup throws', async () =>
 })
 
 /** A DSH_HOME sandbox plus a minimal 0.2.x-shaped host over a mutable agent table. */
-function sandbox(marker) {
+function sandbox(marker, { controller, localePreference } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-restart-auto-continue-'))
   const markerPath = path.join(root, 'dsh-resume.json')
   const previousHome = process.env.DSH_HOME
@@ -167,6 +167,7 @@ function sandbox(marker) {
   const agents = new Map()
   const followups = []
   const commands = []
+  const routes = []
   process.env.DSH_HOME = root
   console.error = () => {}
   if (marker !== undefined) fs.writeFileSync(markerPath, JSON.stringify(marker), 'utf8')
@@ -176,18 +177,31 @@ function sandbox(marker) {
     status,
     followup(message) { followups.push({ id, text: message.content[0]?.text }) },
   })
+  const effect = (register) => {
+    const cleanup = register()
+    if (typeof cleanup === 'function') cleanups.push(cleanup)
+  }
   const ctx = {
     agents: {
       get: id => agents.get(id),
       roots: () => [...agents.values()],
     },
     commands: { register(command) { commands.push(command) } },
-    effect(register) {
-      const cleanup = register()
-      if (typeof cleanup === 'function') cleanups.push(cleanup)
-    },
+    effect,
     inject(dependencies, callback) {
-      if (dependencies.includes('settings')) callback({ settings: { describe: () => [] } })
+      if (dependencies.includes('settings')) {
+        callback({
+          settings: {
+            describe: () => localePreference === undefined ? [] : [{ ns: 'locale', value: { preference: localePreference } }],
+          },
+        })
+      }
+      if (dependencies.includes('sessionController') && controller !== undefined) {
+        callback({ effect, sessionController: controller })
+      }
+      if (dependencies.includes('webServer')) {
+        callback({ effect, webServer: { register(route) { routes.push(route); return () => {} } } })
+      }
     },
     sandboxPolicy: { resolve() { return undefined } },
     shell: {},
@@ -197,6 +211,7 @@ function sandbox(marker) {
     agents,
     agent,
     commands,
+    routes,
     ctx,
     followups,
     markerPath,
@@ -307,6 +322,119 @@ test('a failed legacy restart drops the resume marker it wrote', async () => {
     const result = await restartCommand.handler({})
     assert.equal(result.kind, 'error')
     assert.equal(fs.existsSync(box.markerPath), false)
+  } finally {
+    box.dispose()
+  }
+})
+
+test('a session no browser re-opens is resumed through the session controller', async () => {
+  const resolved = []
+  let box
+  const controller = {
+    async resolveAgent(id) {
+      resolved.push(id)
+      if (id === 'session-gone') return { error: { code: 'session/not-found', message: 'not found' } }
+      box.agents.set(id, box.agent(id))
+      return { agent: box.agents.get(id) }
+    },
+  }
+  box = sandbox({ sessionIds: ['session-1', 'session-gone'], pid: OTHER_PID }, { controller })
+  try {
+    apply(box.ctx, { ...BASE_CONFIG })
+    await wait(1_200)
+    assert.deepEqual(box.followups.map(f => f.id), ['session-1'])
+    // Each session is resumed once; one that cannot be resumed is dropped early, not after 60s.
+    assert.deepEqual(resolved.sort(), ['session-1', 'session-gone'])
+    assert.equal(box.readMarker(), undefined)
+  } finally {
+    box.dispose()
+  }
+})
+
+test('a session the client already re-opened is not resumed again', async () => {
+  const resolved = []
+  const box = sandbox({ sessionIds: ['session-1'], pid: OTHER_PID }, {
+    controller: { async resolveAgent(id) { resolved.push(id); return { error: { message: 'unexpected' } } } },
+  })
+  try {
+    box.agents.set('session-1', box.agent('session-1'))
+    apply(box.ctx, { ...BASE_CONFIG })
+    await wait(700)
+    assert.deepEqual(resolved, [])
+    assert.deepEqual(box.followups.map(f => f.id), ['session-1'])
+  } finally {
+    box.dispose()
+  }
+})
+
+function webRequest(method, headers = {}) {
+  return {
+    method,
+    socket: { remoteAddress: '127.0.0.1' },
+    headers: { host: '127.0.0.1:3080', origin: 'http://127.0.0.1:3080', ...headers },
+  }
+}
+
+function webResponse() {
+  return { status: undefined, body: '', writeHead(status) { this.status = status }, end(body = '') { this.body = body } }
+}
+
+test('the UI locale a browser reports is recorded with the restart and words the continue prompt', async () => {
+  const box = sandbox()
+  try {
+    box.agents.set('session-1', box.agent('session-1', 'running'))
+    let releaseShell
+    box.ctx.shell = { resolve: request => request, execute: () => new Promise(resolve => { releaseShell = resolve }) }
+    apply(box.ctx, { ...BASE_CONFIG, legacyRestart: ref(true) })
+    const route = box.routes.find(r => r.path === '/plugins/dsh-restart/restart')
+    route.handler(webRequest('GET', { 'x-dsh-locale': 'zh' }), webResponse())
+    const pendingRestart = box.commands.find(command => command.name === 'restart').handler({})
+    const marker = box.readMarker()
+    assert.equal(marker.uiLocale, 'zh')
+    releaseShell({ result: async () => ({ exitCode: 1 }) })
+    await pendingRestart
+  } finally {
+    box.dispose()
+  }
+
+  const restarted = sandbox({ sessionIds: ['session-1'], pid: OTHER_PID, uiLocale: 'zh' })
+  try {
+    restarted.agents.set('session-1', restarted.agent('session-1'))
+    apply(restarted.ctx, { ...BASE_CONFIG })
+    // The new process may hear another locale first; the one shown at restart time wins.
+    restarted.routes[0].handler(webRequest('GET', { 'x-dsh-locale': 'en' }), webResponse())
+    await wait(700)
+    assert.equal(restarted.followups[0]?.text, '（系统已重启完成）请继续之前未完成的工作。')
+  } finally {
+    restarted.dispose()
+  }
+
+  // An explicit Language setting still wins over the browser's locale.
+  const explicit = sandbox({ sessionIds: ['session-1'], pid: OTHER_PID, uiLocale: 'zh' }, { localePreference: 'en' })
+  try {
+    explicit.agents.set('session-1', explicit.agent('session-1'))
+    apply(explicit.ctx, { ...BASE_CONFIG })
+    await wait(700)
+    assert.equal(explicit.followups[0]?.text, '(The system restart is complete.) Please continue the unfinished work.')
+  } finally {
+    explicit.dispose()
+  }
+})
+
+test('without a locale hint the request Accept-Language picks the first built-in language', async () => {
+  const box = sandbox()
+  try {
+    box.agents.set('session-1', box.agent('session-1', 'running'))
+    let releaseShell
+    box.ctx.shell = { resolve: request => request, execute: () => new Promise(resolve => { releaseShell = resolve }) }
+    apply(box.ctx, { ...BASE_CONFIG, legacyRestart: ref(true) })
+    const route = box.routes.find(r => r.path === '/plugins/dsh-restart/restart')
+    route.handler(webRequest('GET', { 'x-dsh-locale': 'en' }), webResponse())
+    route.handler(webRequest('GET', { 'accept-language': 'de-DE,de;q=0.9,zh-CN;q=0.8,en;q=0.7' }), webResponse())
+    const pendingRestart = box.commands.find(command => command.name === 'restart').handler({})
+    assert.equal(box.readMarker().uiLocale, 'zh-CN')
+    releaseShell({ result: async () => ({ exitCode: 1 }) })
+    await pendingRestart
   } finally {
     box.dispose()
   }

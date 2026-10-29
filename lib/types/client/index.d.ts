@@ -22,5 +22,7 @@ export type SettingsCardProps = PropsLocale<typeof NS> & PluginConfigViewProps &
     useDshRestart: <R>(selector: (snapshot: RestartCardState) => R) => R;
     set: (field: string, value: unknown) => void;
     clear: (field: string) => void;
+    /** The UI's active locale, sent with the restart request. */
+    uiLocale: () => string;
 };
 export declare function apply(ctx: Context): void;
