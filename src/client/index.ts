@@ -49,7 +49,9 @@ export function apply(ctx: Context): void {
   }
 
   const store: SnapshotStore<RestartCardState> = createSnapshotStore(project())
-  scope.subscribe(() => { store.set(project()) })
+  // The form is shared per namespace and outlives this plugin, so the listener
+  // must go with this fiber (client hot reload) instead of feeding a dead store.
+  ctx.effect(() => scope.subscribe(() => { store.set(project()) }), 'dsh-restart: config form')
 
   // DSH 0.2.x declares the seat only while the plugin-manager page is open;
   // the helper re-registers the entry on every declaration epoch.

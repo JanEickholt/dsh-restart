@@ -28,6 +28,27 @@ export function SettingsCard(props: SettingsCardProps) {
   const [restartStale, setRestartStale] = useState(false)
   const [restartSucceeded, setRestartSucceeded] = useState(consumeRestartSucceeded)
   const restartController = useRef<AbortController | null>(null)
+  // The prompt is edited as a local draft and written on blur/Enter (and on
+  // unmount). Writing every keystroke trimmed the value, so no space could be
+  // typed between words, and the controlled input fell back to the last
+  // Host-accepted value while each write was in flight, dropping keystrokes.
+  const [promptDraft, setPromptDraft] = useState<string | null>(null)
+  const lastPromptWrite = useRef<string | null>(null)
+  const commitPrompt = useRef<() => void>(() => {})
+  commitPrompt.current = () => {
+    if (promptDraft === null || !state.writable) return
+    const value = promptDraft.trim()
+    if (value === state.continuePrompt || value === lastPromptWrite.current) return
+    lastPromptWrite.current = value
+    if (value === '') clear('continuePrompt')
+    else set('continuePrompt', value)
+  }
+  // A new accepted value (our own write echoing back, or another editor) wins.
+  useEffect(() => {
+    setPromptDraft(null)
+    lastPromptWrite.current = null
+  }, [state.continuePrompt])
+  useEffect(() => () => { commitPrompt.current() }, [])
 
   useEffect(() => () => { restartController.current?.abort() }, [])
   useEffect(() => {
@@ -39,10 +60,6 @@ export function SettingsCard(props: SettingsCardProps) {
   if (props.view !== 'page' || !state.available) return null
   const disabled = !state.writable
 
-  const text = (field: string, value: string): void => {
-    if (value.trim() === '') clear(field)
-    else set(field, value.trim())
-  }
   const restartNow = async (): Promise<void> => {
     if (restarting) return
     setRestarting(true)
@@ -87,7 +104,7 @@ export function SettingsCard(props: SettingsCardProps) {
 
       <label className={css.field} htmlFor="dsh-restart-continue-prompt">
         <span className={css.label}>{t('continuePrompt')}</span>
-        <input id="dsh-restart-continue-prompt" className={css.input} type="text" value={state.continuePrompt} disabled={disabled} onChange={event => { text('continuePrompt', event.currentTarget.value) }} />
+        <input id="dsh-restart-continue-prompt" className={css.input} type="text" value={promptDraft ?? state.continuePrompt} disabled={disabled} onChange={event => { setPromptDraft(event.currentTarget.value) }} onBlur={() => { commitPrompt.current() }} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur() }} />
         <span className={css.hint}>{t('continuePromptHint')}</span>
       </label>
 
